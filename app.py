@@ -5,11 +5,13 @@ Trains a classifier on network/web traffic records (label: 0 = benign, 1 = attac
 then lets a user explore the model's performance and try it on new traffic records --
 either typed in by hand or uploaded as a CSV.
 
-Feature engineering note: the raw dataset's strongest signal turned out to live in the
-user_agent string (known attack/scanning tools have a far higher attack rate than normal
-browsers) rather than in the raw numeric columns, which were checked and found to carry
-almost no signal on their own (see README for the numbers). is_known_attack_tool below is
-built from that finding.
+Feature engineering note: the raw dataset's strongest signal lives in two places --
+the user_agent string (known attack/scanning tools have a far higher attack rate than
+normal browsers) and the destination port's rarity (traffic to an unusual port has a
+much higher attack rate than traffic to a common one, independently of the user_agent
+finding). Both are checked and confirmed in the companion notebook
+(notebooks/14_cybersecurity_threat_detector.ipynb). The raw numeric columns and URL
+content were checked too and found to carry almost no signal on their own.
 """
 
 from pathlib import Path
@@ -41,7 +43,12 @@ KNOWN_ATTACK_TOOLS = [
     "gobuster", "dirbuster", "wpscan",
 ]
 
-FEATURE_COLUMNS = ["is_known_attack_tool", "src_port", "dst_port", "bytes_sent", "bytes_received"]
+# A destination port appearing fewer than this many times in the training data is
+# treated as "rare" -- traffic to rare ports showed roughly 6x the attack rate of
+# traffic to common ports (80, 443, 22, etc.), independent of the user_agent signal.
+RARE_PORT_THRESHOLD = 10
+
+FEATURE_COLUMNS = ["is_known_attack_tool", "is_rare_dst_port", "src_port_freq", "bytes_sent", "bytes_received"]
 
 st.set_page_config(page_title="Cybersecurity Threat Detector", page_icon="🛡️", layout="wide")
 
@@ -50,13 +57,10 @@ st.set_page_config(page_title="Cybersecurity Threat Detector", page_icon="🛡�
 # Feature engineering
 # ----------------------------------------------------------------------------
 
-def engineer_features(raw_df: pd.DataFrame) -> pd.DataFrame:
-    """Add is_known_attack_tool from user_agent; keep the numeric columns as-is.
-
-    src_ip / dst_ip are dropped (100% unique per row -- pure noise, not a
-    generalizable pattern), and url / protocol / is_internal_traffic are dropped
-    because they showed no meaningful relationship with the label when checked.
-    """
+def add_user_agent_feature(raw_df: pd.DataFrame) -> pd.DataFrame:
+    """is_known_attack_tool depends only on each row's own user_agent, so it's safe
+    to compute before splitting -- unlike the port-frequency features below, it
+    doesn't leak information between rows."""
     df = raw_df.copy()
     df["is_known_attack_tool"] = (
         df["user_agent"].fillna("").str.lower()
@@ -73,17 +77,33 @@ def engineer_features(raw_df: pd.DataFrame) -> pd.DataFrame:
 @st.cache_data
 def load_data() -> pd.DataFrame:
     raw_df = pd.read_csv(DATA_PATH)
-    return engineer_features(raw_df)
+    return add_user_agent_feature(raw_df)
 
 
 @st.cache_resource
 def train_pipeline(df: pd.DataFrame):
-    X = df[FEATURE_COLUMNS]
     y = df[TARGET_COLUMN].astype(int)
-
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=RANDOM_STATE, stratify=y
+    train_idx, test_idx = train_test_split(
+        df.index, test_size=0.2, random_state=RANDOM_STATE, stratify=y
     )
+    df_train = df.loc[train_idx].copy()
+    df_test = df.loc[test_idx].copy()
+
+    # is_rare_dst_port and src_port_freq both depend on counting how often a port
+    # value occurs -- if that count included the test set, the test set would leak
+    # information about itself into the features (the same risk as fitting a scaler
+    # on the full dataset). Fit both lookups on TRAINING data only; a port never
+    # seen in training defaults to "rare" / frequency 0, the safe assumption.
+    dst_port_freq_map = df_train["dst_port"].value_counts()
+    df_train["is_rare_dst_port"] = (df_train["dst_port"].map(dst_port_freq_map) < RARE_PORT_THRESHOLD).astype(int)
+    df_test["is_rare_dst_port"] = (df_test["dst_port"].map(dst_port_freq_map).fillna(0) < RARE_PORT_THRESHOLD).astype(int)
+
+    src_port_freq_map = df_train["src_port"].value_counts()
+    df_train["src_port_freq"] = df_train["src_port"].map(src_port_freq_map)
+    df_test["src_port_freq"] = df_test["src_port"].map(src_port_freq_map).fillna(0)
+
+    X_train, y_train = df_train[FEATURE_COLUMNS], df_train[TARGET_COLUMN].astype(int)
+    X_test, y_test = df_test[FEATURE_COLUMNS], df_test[TARGET_COLUMN].astype(int)
 
     # class_weight="balanced" matters a lot here: with only ~4% of rows being
     # attacks, a model trained without it just learns to predict "benign" every
@@ -108,6 +128,8 @@ def train_pipeline(df: pd.DataFrame):
         "model": model,
         "model_name": "Decision Tree (class-balanced)",
         "feature_columns": FEATURE_COLUMNS,
+        "dst_port_freq_map": dst_port_freq_map,
+        "src_port_freq_map": src_port_freq_map,
         "X_test": X_test,
         "y_test": y_test,
         "y_pred": y_pred,
@@ -115,6 +137,18 @@ def train_pipeline(df: pd.DataFrame):
         "metrics": metrics,
         "class_balance": y.value_counts(normalize=True).to_dict(),
     }
+
+
+def engineer_new_request(raw_df: pd.DataFrame, pipeline: dict) -> pd.DataFrame:
+    """Apply the same feature engineering to new (unseen) requests, using the
+    port-frequency lookups fit on the original training data -- never refit on
+    new input, for the same leakage reason covered in train_pipeline()."""
+    df = add_user_agent_feature(raw_df)
+    df["is_rare_dst_port"] = (
+        df["dst_port"].map(pipeline["dst_port_freq_map"]).fillna(0) < RARE_PORT_THRESHOLD
+    ).astype(int)
+    df["src_port_freq"] = df["src_port"].map(pipeline["src_port_freq_map"]).fillna(0)
+    return df
 
 
 df = load_data()
@@ -166,14 +200,16 @@ if page == "Overview":
 
     st.subheader("Where the model's signal actually comes from")
     st.info(
-        "The raw numeric columns (ports, byte counts) and the URL path barely relate "
-        "to the label on their own. The one feature that does carry real signal is "
-        "**`user_agent`**: requests from known scanning/exploitation tools (e.g. "
-        "`sqlmap`, `zgrab`, `nikto`) have a roughly **10x higher attack rate** than "
-        "requests from normal browsers or standard HTTP clients. That single "
-        "engineered feature (`is_known_attack_tool`) is doing most of the work here "
-        "-- see **Model Performance** for the honest numbers, including where the "
-        "model still gets it wrong."
+        "Byte counts and raw port numbers barely relate to the label on their own, "
+        "and neither does the URL path. Two engineered features do carry real "
+        "signal, independently of each other: **`is_known_attack_tool`** -- "
+        "requests from known scanning/exploitation tools (e.g. `sqlmap`, `zgrab`, "
+        "`nikto`) have a roughly **6-10x higher attack rate** than normal browsers "
+        "or standard HTTP clients -- and **`is_rare_dst_port`** -- traffic to a "
+        "destination port that's rarely used elsewhere in the data has a roughly "
+        "**6x higher attack rate**, even among requests with a completely ordinary "
+        "user agent. See **Model Performance** for the honest numbers, including "
+        "where the model still gets it wrong."
     )
 
 # ----------------------------------------------------------------------------
@@ -196,20 +232,24 @@ elif page == "Try a Prediction":
                 help="Try entering 'sqlmap/1.8' or 'zgrab/0.x' to see how a known attack tool is flagged.",
             )
             src_port = st.number_input("Source port", min_value=0, max_value=65535, value=51000)
-            dst_port = st.number_input("Destination port", min_value=0, max_value=65535, value=443)
+            dst_port = st.number_input(
+                "Destination port", min_value=0, max_value=65535, value=443,
+                help="Try an unusual value like 31337 to see the rare-port signal fire on its own.",
+            )
         with col_b:
             bytes_sent = st.number_input("Bytes sent", min_value=0, value=20000)
             bytes_received = st.number_input("Bytes received", min_value=0, value=35000)
 
         if st.button("Classify this request", type="primary"):
-            is_tool = int(any(tool in user_agent.lower() for tool in KNOWN_ATTACK_TOOLS))
-            record = pd.DataFrame([{
-                "is_known_attack_tool": is_tool,
+            raw_record = pd.DataFrame([{
+                "user_agent": user_agent,
                 "src_port": src_port,
                 "dst_port": dst_port,
                 "bytes_sent": bytes_sent,
                 "bytes_received": bytes_received,
-            }])[pipeline["feature_columns"]]
+            }])
+            engineered = engineer_new_request(raw_record, pipeline)
+            record = engineered[pipeline["feature_columns"]]
 
             pred = pipeline["model"].predict(record)[0]
             proba = pipeline["model"].predict_proba(record)[0, 1]
@@ -218,8 +258,14 @@ elif page == "Try a Prediction":
             st.subheader(f"Prediction: {label}")
             st.metric("Predicted attack probability", f"{proba:.1%}")
             st.progress(min(max(proba, 0.0), 1.0))
-            if is_tool:
-                st.caption("Flagged: user agent matches a known scanning/exploitation tool.")
+
+            reasons = []
+            if engineered["is_known_attack_tool"].iloc[0]:
+                reasons.append("user agent matches a known scanning/exploitation tool")
+            if engineered["is_rare_dst_port"].iloc[0]:
+                reasons.append(f"destination port {dst_port} is rarely seen in the training data")
+            if reasons:
+                st.caption("Flagged because: " + "; ".join(reasons) + ".")
 
     with tab2:
         st.markdown(
@@ -234,11 +280,7 @@ elif page == "Try a Prediction":
             if missing_cols:
                 st.error(f"Missing required columns: {sorted(missing_cols)}")
             else:
-                new_df["is_known_attack_tool"] = (
-                    new_df["user_agent"].fillna("").str.lower()
-                    .apply(lambda ua: any(tool in ua for tool in KNOWN_ATTACK_TOOLS))
-                    .astype(int)
-                )
+                new_df = engineer_new_request(new_df, pipeline)
                 X_new = new_df[pipeline["feature_columns"]]
                 new_df["predicted_label"] = pipeline["model"].predict(X_new)
                 new_df["attack_probability"] = pipeline["model"].predict_proba(X_new)[:, 1]

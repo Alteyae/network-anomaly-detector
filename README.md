@@ -49,22 +49,38 @@ every click.
 
 The raw dataset (`cybersecurity_threat_data.csv`) has 10,000 rows and a
 ~96%/4% benign/attack split. Before building anything, each column was
-checked individually for how much it actually relates to the label:
+checked individually for how much it actually relates to the label —
+this investigation is laid out in full, with visualizations, in
+[`notebooks/14_cybersecurity_threat_detector.ipynb`](https://github.com/Alteyae/ml-cst9/blob/main/notebooks/14_cybersecurity_threat_detector.ipynb)
+in the companion course repo:
 
 | Column | Verdict |
 |---|---|
 | `src_ip`, `dst_ip` | Dropped — 100% unique per row, no generalizable pattern |
 | `protocol`, `is_internal_traffic` | Dropped — attack rate is nearly identical across every value |
 | `url` | Dropped — attack rate is the same whether or not the URL contains suspicious keywords (`admin`, `.env`, `?id=`, etc.) or is missing |
+| `timestamp` | Dropped — attack rate is flat across every hour of the day |
 | `bytes_sent`, `bytes_received` | Kept, but weak — raw correlation looked promising (0.14) until log-transforming to remove outlier skew dropped it to ~0.02 |
-| `user_agent` | **This is where the real signal is.** Requests from known scanning/exploitation tools (`sqlmap`, `zgrab`, `nikto`, `nmap`, and others) have roughly a **10x higher attack rate** (≈30%) than requests from normal browsers or standard HTTP clients (≈3%). |
+| `user_agent` | **Real signal.** Requests from known scanning/exploitation tools (`sqlmap`, `zgrab`, `nikto`, `nmap`, and others) have roughly a **6-10x higher attack rate** than requests from normal browsers or standard HTTP clients. |
+| `dst_port` | **A second, independent real signal.** Traffic to a destination port that's rarely used elsewhere in the data has roughly a **6x higher attack rate** than traffic to a common port (80, 443, 22, etc.) — and this holds even among requests with a completely ordinary user agent. |
 
-That finding is why `app.py` engineers a single boolean feature,
-`is_known_attack_tool`, from `user_agent` rather than using the raw text
-column or the columns that turned out to carry no signal. The trained
-model's feature importances (visible on the **Model Performance** page)
-confirm it's the strongest predictor, followed by the port and byte-count
-columns.
+Those two findings are why `app.py` engineers `is_known_attack_tool` and
+`is_rare_dst_port`, plus a weaker `src_port_freq` feature, rather than
+using the raw columns directly. Both port-based features are fit on the
+**training split only** (the same leakage rule as scaling a numeric
+feature) — a port count that includes test rows would leak a little
+information about the test set into training. The trained model's
+feature importances (visible on the **Model Performance** page) confirm
+`is_known_attack_tool` and `is_rare_dst_port` are the two strongest
+predictors.
+
+**Why two independent features matter more than one:** the single
+`is_known_attack_tool` feature only catches attacks that self-identify
+via a known tool's user agent string — trivially evaded by an attacker
+using a normal browser string. Adding `is_rare_dst_port` catches a
+different failure mode (unusual port probing) that doesn't depend on the
+user agent at all, which is why adding it raised recall from ~64% to
+~79% and AUC from ~0.77 to ~0.84.
 
 **`class_weight="balanced"`** is used deliberately: without it, the model
 just learns to predict "benign" for everything and still scores ~96%
@@ -73,6 +89,25 @@ imbalanced classification always risks. Balancing trades some accuracy
 for much higher recall, which is the right tradeoff for a security tool
 where a missed attack usually costs more than a false alarm an analyst
 has to double-check.
+
+## Honest limitations
+
+This is a teaching/demo project, not a production-ready detector:
+
+- **Precision is low (~0.18).** For every real attack the model correctly
+  flags, it also flags several benign requests. In real use this means a
+  lot of false alarms to triage.
+- **It still misses roughly 1 in 5 real attacks** (recall ~0.79), and the
+  attacks it catches are mostly ones that trip one of the two engineered
+  features. An attacker avoiding a known tool's default user agent *and*
+  a rare port would likely slip through.
+- **Only ~400 attack examples total**, spread across 9 attack types —
+  some types have under 15 examples, too few to learn a type-specific
+  pattern from.
+- The dataset is synthetic. A real deployment would need real traffic
+  data, and the specific signals that work here (fixed tool user agent
+  strings, port rarity) may not transfer directly to a different
+  environment.
 
 ## Files
 
