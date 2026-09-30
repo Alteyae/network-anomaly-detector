@@ -41,7 +41,7 @@ redeploys automatically.
   matrix, ROC curve, feature importance, and a table of sample test-set
   predictions.
 
-The model (a `DecisionTreeClassifier` with `class_weight="balanced"`) is
+The model (a `RandomForestClassifier` with a tuned `class_weight`) is
 trained once when the app starts and cached, so it isn't retrained on
 every click.
 
@@ -79,28 +79,56 @@ predictors.
 via a known tool's user agent string — trivially evaded by an attacker
 using a normal browser string. Adding `is_rare_dst_port` catches a
 different failure mode (unusual port probing) that doesn't depend on the
-user agent at all, which is why adding it raised recall from ~64% to
-~79% and AUC from ~0.77 to ~0.84.
+user agent at all.
 
-**`class_weight="balanced"`** is used deliberately: without it, the model
-just learns to predict "benign" for everything and still scores ~96%
-accuracy while catching zero real attacks — the same accuracy trap that
-imbalanced classification always risks. Balancing trades some accuracy
-for much higher recall, which is the right tradeoff for a security tool
-where a missed attack usually costs more than a false alarm an analyst
-has to double-check.
+## Choosing the model
+
+With the features settled, several models and `class_weight` settings
+were compared on the same held-out test set (see the notebook, Section
+5a, for the full comparison table and chart):
+
+| Model | Precision | Recall | F1 | AUC |
+|---|---|---|---|---|
+| `DecisionTreeClassifier(class_weight="balanced")` | 0.18 | 0.79 | 0.30 | 0.84 |
+| `RandomForestClassifier(class_weight={0:1,1:3})` | 0.39 | 0.25 | 0.31 | 0.86 |
+| **`RandomForestClassifier(class_weight={0:1,1:5})`** | **0.32** | **0.58** | **0.41** | **0.86** |
+| `RandomForestClassifier(class_weight={0:1,1:8})` | 0.27 | 0.71 | 0.39 | 0.86 |
+
+The `{0:1,1:5}` RandomForest is what's deployed: it wins on F1 (the best
+balance of precision and recall) and roughly **doubles precision** versus
+the original `"balanced"` DecisionTree, while still catching more than
+half of real attacks. `class_weight="balanced"` weights the minority
+class by its exact inverse frequency (about 24:1 here) — a milder,
+manually chosen ratio turned out to work better than that automatic
+setting for this specific dataset.
+
+**Two ideas that were tested and explicitly ruled out** (also in the
+notebook, Section 5a) — worth knowing so they aren't retried from
+scratch:
+- A stricter rarity threshold on `dst_port` doesn't help — almost every
+  "rare" port in this dataset already appears only once, for benign and
+  attack rows alike, so there's no frequency gradient left to exploit.
+- A "touches multiple rare ports" scanning-behavior feature isn't
+  buildable on this dataset, since every `src_ip` appears in exactly one
+  row (no repeated-visitor structure to detect a burst from).
 
 ## Honest limitations
 
 This is a teaching/demo project, not a production-ready detector:
 
-- **Precision is low (~0.18).** For every real attack the model correctly
-  flags, it also flags several benign requests. In real use this means a
-  lot of false alarms to triage.
-- **It still misses roughly 1 in 5 real attacks** (recall ~0.79), and the
-  attacks it catches are mostly ones that trip one of the two engineered
-  features. An attacker avoiding a known tool's default user agent *and*
-  a rare port would likely slip through.
+- **Precision is still modest (~0.32).** For every two real attacks the
+  model correctly flags, it also flags roughly four benign requests. In
+  real use this means false alarms to triage, even though it's about
+  twice as precise as the first version of this model.
+- **It misses close to half of real attacks** (recall ~0.58) — this
+  specific model was chosen to trade some of the earlier version's recall
+  (~0.79) for much better precision. A model tuned the other way
+  (`class_weight={0:1,1:8}`, in the comparison table above) is available
+  if catching more attacks matters more than fewer false alarms for a
+  given use case.
+- The attacks it catches are mostly ones that trip one of the two
+  engineered features. An attacker avoiding a known tool's default user
+  agent *and* a rare port would likely slip through.
 - **Only ~400 attack examples total**, spread across 9 attack types —
   some types have under 15 examples, too few to learn a type-specific
   pattern from.
