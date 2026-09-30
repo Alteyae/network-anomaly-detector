@@ -228,22 +228,64 @@ elif page == "Try a Prediction":
     tab1, tab2 = st.tabs(["Manual entry", "Upload CSV"])
 
     with tab1:
-        st.markdown("Fill in the request details below.")
+        # Widget defaults come from session_state, seeded once with setdefault() below.
+        # The Randomize button overwrites those same session_state keys before the
+        # widgets are (re)created -- a widget that has a `key` can't also take a
+        # `value` argument (Streamlit warns loudly and the value= is ignored), so
+        # every default lives in session_state instead, and the widgets below only
+        # pass `key=`.
+        NORMAL_USER_AGENTS = [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X)",
+            "curl/8.4.0",
+            "python-requests/2.31.0",
+        ]
+        COMMON_DST_PORTS = [80, 443, 22, 21, 25, 53, 445, 1433, 3306, 3389]
+
+        st.session_state.setdefault("ua_input", NORMAL_USER_AGENTS[0])
+        st.session_state.setdefault("src_port_input", 51000)
+        st.session_state.setdefault("dst_port_input", 443)
+        st.session_state.setdefault("bytes_sent_input", 20000)
+        st.session_state.setdefault("bytes_received_input", 35000)
+
+        def randomize_request():
+            # ~30% chance of drawing a known attack tool / rare port, so the button
+            # sometimes produces an interesting "attack" case and not just benign traffic.
+            if np.random.rand() < 0.3:
+                st.session_state["ua_input"] = np.random.choice(KNOWN_ATTACK_TOOLS) + f"/{np.random.randint(1, 9)}.{np.random.randint(0, 9)}"
+            else:
+                st.session_state["ua_input"] = np.random.choice(NORMAL_USER_AGENTS)
+
+            if np.random.rand() < 0.3:
+                st.session_state["dst_port_input"] = int(np.random.randint(1024, 65535))
+            else:
+                st.session_state["dst_port_input"] = int(np.random.choice(COMMON_DST_PORTS))
+
+            st.session_state["src_port_input"] = int(np.random.randint(1024, 65535))
+            st.session_state["bytes_sent_input"] = int(np.random.randint(200, 200_000))
+            st.session_state["bytes_received_input"] = int(np.random.randint(200, 200_000))
+
+        st.button("🎲 Randomize", on_click=randomize_request)
+        st.markdown("Fill in the request details below, or click Randomize for a random example.")
         col_a, col_b = st.columns(2)
         with col_a:
             user_agent = st.text_input(
                 "User agent string",
-                value="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
                 help="Try entering 'sqlmap/1.8' or 'zgrab/0.x' to see how a known attack tool is flagged.",
+                key="ua_input",
             )
-            src_port = st.number_input("Source port", min_value=0, max_value=65535, value=51000)
+            src_port = st.number_input(
+                "Source port", min_value=0, max_value=65535, key="src_port_input"
+            )
             dst_port = st.number_input(
-                "Destination port", min_value=0, max_value=65535, value=443,
+                "Destination port", min_value=0, max_value=65535,
                 help="Try an unusual value like 31337 to see the rare-port signal fire on its own.",
+                key="dst_port_input",
             )
         with col_b:
-            bytes_sent = st.number_input("Bytes sent", min_value=0, value=20000)
-            bytes_received = st.number_input("Bytes received", min_value=0, value=35000)
+            bytes_sent = st.number_input("Bytes sent", min_value=0, key="bytes_sent_input")
+            bytes_received = st.number_input("Bytes received", min_value=0, key="bytes_received_input")
 
         if st.button("Classify this request", type="primary"):
             raw_record = pd.DataFrame([{
